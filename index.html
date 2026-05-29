@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Production Andon Board</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div>
+        <div class="supervisor-panel">
+            <form id="targetForm" onsubmit="submitTarget(event)">
+                <label for="target">Daily Target: </label>
+                <input type="number" id="target" name="target" value="__DAILY_TARGET__" required>
+                <button type="submit">Update Board</button>
+            </form>
+            <div id="connectionStatus" class="status-banner">WebSocket: <span class="disconnected">Connecting...</span></div>
+        </div>
+
+        <div class="testing-panel" style="display: none;">
+            <form id="testScanForm" onsubmit="submitTestScan(event)">
+                <label for="testBarcode">Mock Barcode: </label>
+                <input type="text" id="testBarcode" name="barcode" placeholder="e.g. BARCODE123" required>
+                <button type="submit" class="btn-test">⚡ Trigger Scan Button</button>
+            </form>
+            <div id="testStatus" class="status-banner" style="color: #ff9900;">Ready for mock scan.</div>
+        </div>
+    </div>
+
+    <div class="dashboard-container">
+        
+        <div class="main-table-section">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Hour Shift Block</th>
+                        <th>Actual Scans</th>
+                        <th>Hourly Target (Rolling Sum)</th>
+                        <th>Efficiency</th>
+                    </tr>
+                </thead>
+                <tbody id="grid-body"></tbody>
+            </table>
+        </div>
+
+        <div class="sidebar-section">
+            <h3 style="color: #ff9900; margin-top: 0; font-size: 24px; text-transform: uppercase;">Scan Type Summary</h3>
+            <table class="sidebar-table">
+                <thead>
+                    <tr>
+                        <th>Classification Type</th>
+                        <th>Total Count</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td><b>Single (SH)</b></td><td id="count-sh" class="type-val">0</td></tr>
+                    <tr><td><b>Twin (TWIN)</b></td><td id="count-twin" class="type-val">0</td></tr>
+                    <tr><td><b>Triple (TRIPLE)</b></td><td id="count-triple" class="type-val">0</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+
+    <script>
+    function renderGrid(payload) {
+        const shiftData = payload.shift_grid ? payload.shift_grid : payload;
+        
+        const tbody = document.getElementById('grid-body');
+        tbody.innerHTML = '';
+        
+        shiftData.forEach(row => {
+            let effDisplay = row.efficiency + '%';
+            let effClass = row.efficiency >= 80 ? 'high-eff' : 'low-eff';
+            
+            if (row.is_break) {
+                effDisplay = "BREAK";
+                effClass = "high-eff";
+            }
+
+            let targetDisplay;
+            if (row.is_break) {
+                targetDisplay = '<div>0</div><div style="font-size: 16px; color: #666; margin-top: 4px;">(' + row.running_target + ')</div>';
+            } else {
+                targetDisplay = '<div>' + row.target + '</div><div style="font-size: 16px; color: #888; font-style: italic; margin-top: 4px;">Total: ' + row.running_target + '</div>';
+            }
+
+            tbody.innerHTML += `
+                <tr>
+                    <td><b>${row.hour}</b></td>
+                    <td>${row.actual}</td>
+                    <td>${targetDisplay}</td>
+                    <td class="${effClass}">${effDisplay}</td>
+                </tr>
+            `;
+        });
+
+        if (payload.type_counts) {
+            document.getElementById('count-sh').innerText = payload.type_counts.SH;
+            document.getElementById('count-twin').innerText = payload.type_counts.TWIN;
+            document.getElementById('count-triple').innerText = payload.type_counts.TRIPLE;
+        }
+    }
+
+    const initialData = __INITIAL_DATA_JSON__;
+    renderGrid(initialData);
+
+    function setupWebSocket() {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const ws = new WebSocket(wsProtocol + window.location.host + '/ws/andon');
+        const statusEl = document.getElementById('connectionStatus');
+
+        ws.onopen = function() {
+            statusEl.innerHTML = 'WebSocket: <span class="connected">LIVE</span>';
+        };
+
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            renderGrid(data);
+        };
+
+        ws.onclose = function() {
+            statusEl.innerHTML = 'WebSocket: <span class="disconnected">OFFLINE (Reconnecting...)</span>';
+            setTimeout(setupWebSocket, 3000);
+        };
+    }
+    
+    setupWebSocket();
+
+    async function submitTarget(event) {
+        event.preventDefault();
+        const formData = new FormData(document.getElementById('targetForm'));
+        await fetch('/update-target', { method: 'POST', body: formData });
+    }
+        
+    async function submitTestScan(event) {
+        event.preventDefault();
+        const statusEl = document.getElementById('testStatus');
+        const formData = new FormData(document.getElementById('testScanForm'));
+        
+        statusEl.innerText = "Processing scan...";
+        try {
+            const response = await fetch('/test-scan', { method: 'POST', body: formData });
+            const result = await response.json();
+            statusEl.innerText = result.message;
+        } catch (err) {
+            statusEl.innerText = "Error reaching test endpoint.";
+        }
+    }
+
+    let barcodeBuffer = "";
+    let lastKeyTime = Date.now();
+
+    window.addEventListener("keydown", function(e) {
+        const currentTime = Date.now();
+        
+        if (currentTime - lastKeyTime > 50) {
+            barcodeBuffer = ""; 
+        }
+        lastKeyTime = currentTime;
+
+        if (e.key === "Enter") {
+            if (barcodeBuffer.length > 2) {
+                processAutomaticScan(barcodeBuffer);
+            }
+            barcodeBuffer = ""; 
+            e.preventDefault();
+            return;
+        }
+
+        if (e.key.length === 1) {
+            barcodeBuffer += e.key;
+        }
+    });
+
+    async function processAutomaticScan(barcode) {
+        const statusEl = document.getElementById('testStatus');
+        if (statusEl) {
+            statusEl.innerText = "Hardware scan detected: " + barcode;
+        }
+        
+        const formData = new FormData();
+        formData.append("barcode", barcode);
+        
+        try {
+            const response = await fetch('/test-scan', { method: 'POST', body: formData });
+            const result = await response.json();
+            if (statusEl) {
+                statusEl.innerText = "Logged: " + result.message;
+            }
+        } catch (err) {
+            console.error("Failed to route automatic scan transmission:", err);
+            if (statusEl) {
+                statusEl.innerText = "Error logging hardware scan.";
+            }
+        }
+    }
+</script>
+</body>
+</html>
